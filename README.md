@@ -6,48 +6,33 @@ Retrieval-Augmented Generation (inference-only) on a QLoRA fine-tuned StarCoder2
 
 ## Project Overview
 
-This project extends a previously fine-tuned StarCoder2-3B code repair model with a retrieval mechanism that injects similar bug-fix examples from the training set into the prompt at inference time. No additional training is performed — the model weights remain frozen.
+This project extends a previously fine-tuned StarCoder2-3B code repair model with a retrieval mechanism that injects the single most similar bug-fix example from the training set into the prompt at inference time. No additional training is performed — model weights remain frozen.
 
-The core idea: when fixing a buggy code snippet, show the model one highly similar bug-fix pair from its training data as a reference, then ask it to fix the target code.
+The core idea: when fixing a buggy code snippet, retrieve one highly similar bug-fix pair from training data. If similarity exceeds 0.85, prepend it as a reference example. Then ask the model to fix the target code.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Query: buggy code from test set                │
-└──────────────────┬──────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────┐
-│  SentenceTransformer (all-MiniLM-L6-v2)         │
-│  Encode query to 384-dim embedding              │
-└──────────────────┬──────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────┐
-│  FAISS Index (cosine similarity)                │
-│  20,077 training buggy code embeddings          │
-│  Return top-1 similar example                   │
-└──────────────────┬──────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────┐
-│  Prompt Construction                            │
-│  If similarity > 0.85:                          │
-│    [retrieved buggy → fixed pair]               │
-│    [target buggy code]                          │
-│  Else:                                          │
-│    [target buggy code only]                     │
-└──────────────────┬──────────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────────┐
-│  StarCoder2-3B (base + LoRA checkpoint-2200)    │
-│  Generate fixed code                            │
-│  Stop at <|endoftext|> (token ID 0)             │
-└─────────────────────────────────────────────────┘
+Query: buggy code from test/val set
+    ↓
+SentenceTransformer (all-MiniLM-L6-v2)
+Encode to 384-dim embedding
+    ↓
+FAISS Index (cosine similarity)
+20,077 training buggy code embeddings
+Return top-1 similar example
+    ↓
+If similarity > 0.85:
+    [retrieved buggy → fixed pair]
+    [target buggy code]
+Else:
+    [target buggy code only]
+    ↓
+StarCoder2-3B (base + LoRA checkpoint-2200)
+Generate fixed code
+Stop at <|endoftext|> (token ID 0)
 ```
 
 ---
@@ -70,30 +55,41 @@ The core idea: when fixing a buggy code snippet, show the model one highly simil
 | Parameter | Value |
 |-----------|-------|
 | Embedding Model | all-MiniLM-L6-v2 (384-dim) |
-| Index Type | FAISS IndexFlatIP (inner product = cosine after L2 normalization) |
+| Index Type | FAISS IndexFlatIP |
 | Knowledge Base | 20,077 train samples |
 | k (retrieval) | 1 |
-| Similarity Threshold | 0.85 (skip RAG below this) |
+| Similarity Threshold | 0.85 |
 | Max Sequence Length | 1024 tokens |
 | Max New Tokens | 378 |
-| Decoding | Greedy (do_sample=False) |
+| Decoding | Greedy |
 
 ---
 
 ## Dataset
 
-Custom hybrid dataset of Python buggy/fixed code pairs.
-
 | Split | Samples |
 |-------|---------|
 | Train (RAG index) | 20,077 |
-| Test (evaluation) | 2,510 |
+| Validation | 2,510 |
+| Test | 2,510 |
 
 ---
 
 ## Results
 
-### Full Test Set (2,510 samples)
+### Validation Set (2,510 samples)
+
+| Metric | Non-RAG v3 | RAG v3 | Change |
+|--------|-----------|--------|--------|
+| Exact Match | 16.5% | **22.7%** | **+6.2%** |
+| Corpus BLEU | 88.8 | 86.4 | -2.4 |
+| ROUGE-1 | 89.0 | 88.6 | -0.4 |
+| ROUGE-2 | 82.5 | 82.3 | -0.2 |
+| ROUGE-L | 88.5 | 88.1 | -0.4 |
+| Edit Ratio (mean) | 0.840 | 0.837 | -0.003 |
+| Edit Ratio (median) | 0.873 | 0.871 | -0.002 |
+
+### Test Set (2,510 samples)
 
 | Metric | Non-RAG v3 | RAG v3 | Change |
 |--------|-----------|--------|--------|
@@ -107,13 +103,13 @@ Custom hybrid dataset of Python buggy/fixed code pairs.
 
 ### Key Finding
 
-RAG improves **exact match by +5.7 percentage points** (16.2% → 21.9%) at a slight cost to surface similarity metrics. The retrieved example helps the model produce more precise, targeted fixes — the kind that exactly match the ground truth — even though the overall text is slightly less similar.
+RAG consistently improves exact match by **+5.7% to +6.2%** across both splits, at a small cost to surface similarity metrics (BLEU drops 2-4 points). The retrieved example helps the model produce more precise, targeted fixes that exactly match the ground truth.
 
-This trade-off is favorable for code repair: exact match is the most meaningful metric, and a 35% relative improvement is significant.
+For code repair, exact match is the most meaningful metric. A relative improvement of ~35% is significant.
 
 ---
 
-## Progression Across Versions
+## Progression
 
 | Version | Approach | Test EM | BLEU |
 |---------|----------|---------|------|
@@ -128,25 +124,18 @@ This trade-off is favorable for code repair: exact match is the most meaningful 
 
 | File | Description |
 |------|-------------|
-| `knowledge_base.json` | Retrieved examples metadata (20,077 entries) |
-| `code_index.faiss` | FAISS vector index for fast similarity search |
-| `rag_v3_full_results.csv` | Full test predictions with all metrics |
-| `checkpoint-2200/` | LoRA adapter weights (best checkpoint) |
-
----
-
-## Reproduce
-
-1. **Load model** — base `bigcode/starcoder2-3b` + LoRA adapter `checkpoint-2200`
-2. **Build RAG index** — embed train `buggy_code` with `all-MiniLM-L6-v2`, store in FAISS
-3. **At inference** — retrieve top-1 similar example, prepend to prompt if similarity > 0.85
-4. **Generate** — greedy decoding with stop token `<|endoftext|>`
+| `knowledge_base.json` | RAG knowledge base (20,077 entries) |
+| `code_index.faiss` | FAISS vector index |
+| `rag_v3_test_results.csv` | Full test predictions with metrics |
+| `rag_v3_val_results.csv` | Full validation predictions with metrics |
+| `checkpoint-2200/` | LoRA adapter weights |
 
 ---
 
 ## Limitations
 
-- Retrieval quality depends on embedding model; `all-MiniLM-L6-v2` may not capture code semantics optimally
-- Similarity threshold (0.85) was chosen heuristically — could be tuned
-- Only top-1 retrieval tested; multiple examples hurt performance in early experiments
+- Retrieval quality depends on the embedding model; `all-MiniLM-L6-v2` may not capture code semantics optimally
+- Similarity threshold (0.85) chosen heuristically — could be tuned
+- Only top-1 retrieval tested; multiple examples hurt performance
+- BLEU drops slightly — RAG improves precision at cost of surface similarity
 - The "other" bug type (62% of data) still has low exact match
